@@ -7,9 +7,10 @@ import logging
 import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Deque, Optional
+from typing import Any, Callable, Deque, Optional
 
 import acp
+from acp.exceptions import RequestError
 from acp.schema import (
     AgentCapabilities,
     AuthenticateResponse,
@@ -143,10 +144,16 @@ class HermesACPAgent(acp.Agent):
         },
     )
 
-    def __init__(self, session_manager: SessionManager | None = None):
+    def __init__(
+        self,
+        session_manager: SessionManager | None = None,
+        fact_retriever_factory: Callable[[], Any] | None = None,
+    ):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._fact_retriever_factory = fact_retriever_factory
+        self._fact_retriever: Any | None = None
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -910,3 +917,77 @@ class HermesACPAgent(acp.Agent):
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
+
+    # ---- Extension methods (non-standard ACP) -------------------------------
+
+    def _get_fact_retriever(self) -> Any:
+        """Lazy-construct a FactRetriever bound to the Hermes memory store.
+
+        The retriever (and underlying SQLite connection) is built once per
+        agent instance and reused across calls. Tests inject via
+        ``fact_retriever_factory``.
+        """
+        if self._fact_retriever is not None:
+            return self._fact_retriever
+        if self._fact_retriever_factory is not None:
+            self._fact_retriever = self._fact_retriever_factory()
+            return self._fact_retriever
+        from plugins.memory.holographic.retrieval import FactRetriever
+        from plugins.memory.holographic.store import MemoryStore
+
+        self._fact_retriever = FactRetriever(MemoryStore())
+        return self._fact_retriever
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch ACP extension requests (wire method ``_<name>``).
+
+        Currently exposes ``experimental/factSearch`` as a Paperclip-bridge
+        helper; see ``acp_adapter/README.md`` for stability notes.
+        """
+        if method == "experimental/factSearch":
+            return await self._handle_fact_search(params or {})
+        raise RequestError.method_not_found(f"_{method}")
+
+    async def _handle_fact_search(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle ``experimental/factSearch`` — wraps ``FactRetriever.search``."""
+        query = params.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError.invalid_params({"reason": "query must be a non-empty string"})
+
+        raw_top_k = params.get("topK", 3)
+        try:
+            top_k = int(raw_top_k)
+        except (TypeError, ValueError):
+            raise RequestError.invalid_params({"reason": "topK must be an integer"})
+        if top_k <= 0:
+            top_k = 3
+
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        request_id = meta.get("requestId") if meta else None
+        task_id = meta.get("taskId") if meta else None
+        logger.info(
+            "experimental/factSearch query=%r topK=%d requestId=%s taskId=%s",
+            query[:120],
+            top_k,
+            request_id,
+            task_id,
+        )
+
+        retriever = self._get_fact_retriever()
+        results = await asyncio.to_thread(retriever.search, query, None, 0.3, top_k)
+
+        snippets: list[dict[str, Any]] = []
+        for fact in results:
+            fact_id = fact.get("fact_id")
+            created_at = fact.get("created_at")
+            if created_at is not None and not isinstance(created_at, str):
+                created_at = str(created_at)
+            snippets.append(
+                {
+                    "factId": str(fact_id) if fact_id is not None else "",
+                    "content": str(fact.get("content", "")),
+                    "score": float(fact.get("score", 0.0)),
+                    "createdAt": created_at or "",
+                }
+            )
+        return {"snippets": snippets}
