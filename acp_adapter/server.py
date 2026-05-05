@@ -148,12 +148,14 @@ class HermesACPAgent(acp.Agent):
         self,
         session_manager: SessionManager | None = None,
         fact_retriever_factory: Callable[[], Any] | None = None,
+        honcho_user_model_lookup: Callable[[str], Any] | None = None,
     ):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
         self._fact_retriever_factory = fact_retriever_factory
         self._fact_retriever: Any | None = None
+        self._honcho_user_model_lookup = honcho_user_model_lookup
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -941,11 +943,14 @@ class HermesACPAgent(acp.Agent):
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatch ACP extension requests (wire method ``_<name>``).
 
-        Currently exposes ``experimental/factSearch`` as a Paperclip-bridge
-        helper; see ``acp_adapter/README.md`` for stability notes.
+        Currently exposes ``experimental/factSearch`` and
+        ``experimental/honchoUserModel`` as Paperclip-bridge helpers; see
+        ``acp_adapter/README.md`` for stability notes.
         """
         if method == "experimental/factSearch":
             return await self._handle_fact_search(params or {})
+        if method == "experimental/honchoUserModel":
+            return await self._handle_honcho_user_model(params or {})
         raise RequestError.method_not_found(f"_{method}")
 
     async def _handle_fact_search(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -991,3 +996,51 @@ class HermesACPAgent(acp.Agent):
                 }
             )
         return {"snippets": snippets}
+
+    async def _handle_honcho_user_model(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle ``experimental/honchoUserModel`` — surfaces Hermes' Honcho
+        user-modelling output read-only.
+
+        The lookup is injected at construction time so tests can stub it.
+        When no lookup is configured (Honcho not available in this Hermes
+        process) or when the lookup raises, the method returns
+        ``{"userModel": null}`` rather than a JSON-RPC error so the
+        Paperclip bridge degrades gracefully.
+
+        The payload returned by the lookup is wrapped in a ``userModel``
+        envelope but otherwise passed through untouched — Hermes owns the
+        snapshot shape per the COG-116 §2.5 read-only contract.
+        """
+        user_id = params.get("userId")
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise RequestError.invalid_params(
+                {"reason": "userId must be a non-empty string"}
+            )
+
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        request_id = meta.get("requestId") if meta else None
+        task_id = meta.get("taskId") if meta else None
+        logger.info(
+            "experimental/honchoUserModel userId=%r requestId=%s taskId=%s",
+            user_id,
+            request_id,
+            task_id,
+        )
+
+        lookup = self._honcho_user_model_lookup
+        if lookup is None:
+            return {"userModel": None}
+
+        try:
+            snapshot = await asyncio.to_thread(lookup, user_id)
+        except Exception:
+            logger.debug(
+                "experimental/honchoUserModel lookup failed for %s",
+                user_id,
+                exc_info=True,
+            )
+            return {"userModel": None}
+
+        if snapshot is None:
+            return {"userModel": None}
+        return {"userModel": snapshot}
